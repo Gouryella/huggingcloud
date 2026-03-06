@@ -1,0 +1,32 @@
+services:
+  huggingcloud:
+    image: ghcr.io/gouryella/huggingcloud:latest
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://huggingcloud:huggingcloud@db:5432/huggingcloud
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: huggingcloud
+      POSTGRES_USER: huggingcloud
+      POSTGRES_PASSWORD: huggingcloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
