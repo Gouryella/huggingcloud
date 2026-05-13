@@ -13,6 +13,9 @@ from app.services.system_settings import HFRuntimeConfig, get_effective_hf_confi
 
 logger = logging.getLogger(__name__)
 
+_STREAM_MAX_ATTEMPTS = 4
+_REDIRECT_MAX_ATTEMPTS = 4
+
 
 class HFRepoNotConfiguredError(RuntimeError):
     pass
@@ -24,7 +27,10 @@ class HFClient:
 
     async def http(self) -> httpx.AsyncClient:
         if self._http is None:
-            self._http = httpx.AsyncClient(timeout=None, follow_redirects=True)
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
+                follow_redirects=True,
+            )
         return self._http
 
     @staticmethod
@@ -109,20 +115,28 @@ class HFClient:
             headers['Authorization'] = f'Bearer {config.token}'
         if range_header:
             headers['Range'] = range_header
-        max_attempts = 4
-        for attempt in range(max_attempts):
-            request = client.build_request(method=method, url=self._resolve_url(config, path), headers=headers)
-            response = await client.send(request, stream=True, follow_redirects=True)
+        last_exc: Exception | None = None
+        for attempt in range(_STREAM_MAX_ATTEMPTS):
+            try:
+                request = client.build_request(method=method, url=self._resolve_url(config, path), headers=headers)
+                response = await client.send(request, stream=True, follow_redirects=True)
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                logger.warning('stream_file attempt %d/%d failed: %s', attempt + 1, _STREAM_MAX_ATTEMPTS, exc)
+                if attempt == _STREAM_MAX_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep((2**attempt) * 0.5 + random.uniform(0, 0.3))
+                continue
+
             retryable = response.status_code == 429 or response.status_code >= 500
-            if not retryable or attempt == max_attempts - 1:
+            if not retryable or attempt == _STREAM_MAX_ATTEMPTS - 1:
                 return response
 
             await response.aclose()
             backoff = (2**attempt) * 0.25 + random.uniform(0, 0.2)
             await asyncio.sleep(backoff)
 
-        # Unreachable due return inside loop, kept for type completeness.
-        return await client.send(request, stream=True, follow_redirects=True)
+        raise last_exc  # type: ignore[misc]
 
     async def resolve_redirect_url(self, *, path: str, range_header: str | None = None) -> str | None:
         """Resolve an externally reachable redirect target for a repo file.
@@ -145,8 +159,23 @@ class HFClient:
         max_hops = 4
 
         for _ in range(max_hops):
-            request = client.build_request(method='HEAD', url=current_url, headers=headers)
-            response = await client.send(request, follow_redirects=False)
+            last_exc: Exception | None = None
+            for attempt in range(_REDIRECT_MAX_ATTEMPTS):
+                try:
+                    request = client.build_request(method='HEAD', url=current_url, headers=headers)
+                    response = await client.send(request, follow_redirects=False)
+                except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                    last_exc = exc
+                    logger.warning(
+                        'resolve_redirect_url attempt %d/%d failed for %s: %s',
+                        attempt + 1, _REDIRECT_MAX_ATTEMPTS, current_url, exc,
+                    )
+                    if attempt == _REDIRECT_MAX_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep((2**attempt) * 0.5 + random.uniform(0, 0.3))
+                    continue
+                break
+
             try:
                 location = response.headers.get('location')
                 if response.status_code < 300 or response.status_code >= 400 or not location:
